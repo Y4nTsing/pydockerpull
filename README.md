@@ -1,7 +1,9 @@
 # pydockerpull
 直接纯python文件对harbor仓库进行docker pull
 
-直接将harbor中docker pull的链接部分作为参数传入即可：
+直接将harbor中docker pull的链接部分作为参数传入即可，默认支持以下两种格式：
+<harbor-host>/<project>/<image>:<tag>
+<harbor-host>/<project>/<image>/<image-name>@sha256:<digest>
 
 python3 pull.py x.x.x.x/aaa/bbb@sha256:xxxxxx
 
