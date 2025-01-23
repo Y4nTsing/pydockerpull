@@ -4,6 +4,7 @@ import os
 import tarfile
 import argparse
 import urllib3
+import shutil  # 用于删除目录
 
 # 禁用 SSL 证书验证警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -216,7 +217,7 @@ def main():
     parser.add_argument("pull_link", type=str, help="Docker pull link (e.g., harbor.example.com/myproject/nginx:latest or harbor.example.com/myproject/random-image/random-name@sha256:randomdigest)")
     parser.add_argument("--username", type=str, default="admin", help="Harbor username (default: admin)")
     parser.add_argument("--password", type=str, default="Harbor12345", help="Harbor password (default: Harbor12345)")
-    parser.add_argument("--output-dir", type=str, default="output_image", help="Output directory for the pulled image")
+    parser.add_argument("--output-dir", type=str, default="output_image", help="Temporary directory for storing downloaded files (will be deleted after tar creation)")
     parser.add_argument("--verify-ssl", action="store_true", help="Verify SSL certificate (default: False)")
     parser.add_argument("--hostname", type=str, help="Custom Host header for requests (e.g., harbor.example.com)")
     args = parser.parse_args()
@@ -255,6 +256,14 @@ def main():
         create_image_tar(args.output_dir, tar_path, args.pull_link)
     except Exception as e:
         print(f"Failed to create image tar file: {e}")
+        return
+
+    # 删除临时文件夹
+    try:
+        shutil.rmtree(args.output_dir)
+        print(f"Temporary directory '{args.output_dir}' deleted successfully.")
+    except Exception as e:
+        print(f"Failed to delete temporary directory '{args.output_dir}': {e}")
 
 if __name__ == "__main__":
     main()
