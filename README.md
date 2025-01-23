@@ -1,0 +1,2 @@
+# pydockerpull
+直接纯python文件对harbor仓库进行docker pull
