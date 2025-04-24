@@ -41,16 +41,22 @@ def parse_docker_pull_link(pull_link):
     return harbor_host, project_name, image_name, image_ref
 
 # 获取 Manifest 的 URL
-def get_manifest_url(harbor_host, project_name, image_name, image_ref):
-    return f"https://{harbor_host}/v2/{project_name}/{image_name}/manifests/{image_ref}"
+def get_manifest_url(harbor_host, project_name, image_name, image_ref,portal):
+    if portal=="http":
+        return f"http://{harbor_host}/v2/{project_name}/{image_name}/manifests/{image_ref}"
+    else:
+        return f"https://{harbor_host}/v2/{project_name}/{image_name}/manifests/{image_ref}"
 
 # 获取 Blob（层）的 URL
-def get_blob_url(harbor_host, project_name, image_name, blob_digest):
-    return f"https://{harbor_host}/v2/{project_name}/{image_name}/blobs/{blob_digest}"
+def get_blob_url(harbor_host, project_name, image_name, blob_digest,portal):
+    if portal=="http":
+        return f"http://{harbor_host}/v2/{project_name}/{image_name}/blobs/{blob_digest}"
+    else:
+        return f"https://{harbor_host}/v2/{project_name}/{image_name}/blobs/{blob_digest}"
 
 # 获取镜像的 Manifest
-def get_manifest(harbor_host, project_name, image_name, image_ref, auth=None, verify_ssl=False, hostname=None):
-    url = get_manifest_url(harbor_host, project_name, image_name, image_ref)
+def get_manifest(harbor_host, project_name, image_name, image_ref, auth=None, verify_ssl=False, hostname=None,portal=None):
+    url = get_manifest_url(harbor_host, project_name, image_name, image_ref,portal)
     headers = {
         "Accept": "application/vnd.docker.distribution.manifest.v2+json"
     }
@@ -62,8 +68,8 @@ def get_manifest(harbor_host, project_name, image_name, image_ref, auth=None, ve
     return response.json()
 
 # 下载 Blob（层或 Config 文件）
-def download_blob(harbor_host, project_name, image_name, blob_digest, output_dir, auth=None, verify_ssl=False, hostname=None, is_config=False):
-    url = get_blob_url(harbor_host, project_name, image_name, blob_digest)
+def download_blob(harbor_host, project_name, image_name, blob_digest, output_dir, auth=None, verify_ssl=False, hostname=None, is_config=False,portal=None):
+    url = get_blob_url(harbor_host, project_name, image_name, blob_digest,portal=portal)
     headers = {}
     if hostname:
         headers["Host"] = hostname
@@ -85,13 +91,13 @@ def download_blob(harbor_host, project_name, image_name, blob_digest, output_dir
     return blob_path
 
 # 拉取镜像并保存为 tar 文件
-def pull_image(harbor_host, project_name, image_name, image_ref, output_dir, auth=None, verify_ssl=False, hostname=None):
+def pull_image(harbor_host, project_name, image_name, image_ref, output_dir, auth=None, verify_ssl=False, hostname=None,portal=None):
     # 创建输出目录
     os.makedirs(output_dir, exist_ok=True)
 
     # 获取 Manifest
     try:
-        manifest = get_manifest(harbor_host, project_name, image_name, image_ref, auth, verify_ssl, hostname)
+        manifest = get_manifest(harbor_host, project_name, image_name, image_ref, auth, verify_ssl, hostname,portal=portal)
         print("Manifest fetched successfully.")
     except Exception as e:
         print(f"Failed to fetch manifest: {e}")
@@ -104,7 +110,7 @@ def pull_image(harbor_host, project_name, image_name, image_ref, output_dir, aut
     if not os.path.exists(config_path):
         print(f"Downloading config file: {config_digest}")
         try:
-            download_blob(harbor_host, project_name, image_name, config_digest, output_dir, auth, verify_ssl, hostname, is_config=True)
+            download_blob(harbor_host, project_name, image_name, config_digest, output_dir, auth, verify_ssl, hostname, is_config=True,portal=portal)
         except Exception as e:
             print(f"Failed to download config file: {e}")
             return
@@ -115,7 +121,7 @@ def pull_image(harbor_host, project_name, image_name, image_ref, output_dir, aut
         blob_digest = layer["digest"]
         print(f"Downloading layer: {blob_digest}")
         try:
-            download_blob(harbor_host, project_name, image_name, blob_digest, output_dir, auth, verify_ssl, hostname)
+            download_blob(harbor_host, project_name, image_name, blob_digest, output_dir, auth, verify_ssl, hostname,portal=portal)
         except Exception as e:
             print(f"Failed to download layer {blob_digest}: {e}")
             return
@@ -220,6 +226,7 @@ def main():
     parser.add_argument("--output-dir", type=str, default="output_image", help="Temporary directory for storing downloaded files (will be deleted after tar creation)")
     parser.add_argument("--verify-ssl", action="store_true", help="Verify SSL certificate (default: False)")
     parser.add_argument("--hostname", type=str, help="Custom Host header for requests (e.g., harbor.example.com)")
+    parser.add_argument("--portal", type=str, help="http or https")
     args = parser.parse_args()
 
     # 解析 Docker Pull 链接
@@ -243,9 +250,13 @@ def main():
     if hostname:
         print(f"Using custom Host header: {hostname}")
 
+    portal=args.portal
+    if portal:
+        print(f"Using portal: {portal}")
+
     # 拉取镜像
     try:
-        pull_image(harbor_host, project_name, image_name, image_ref, args.output_dir, auth, verify_ssl, hostname)
+        pull_image(harbor_host, project_name, image_name, image_ref, args.output_dir, auth, verify_ssl, hostname,portal=portal)
     except Exception as e:
         print(f"Failed to pull image: {e}")
         return
