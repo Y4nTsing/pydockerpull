@@ -4,277 +4,380 @@ import os
 import tarfile
 import argparse
 import urllib3
-import shutil  # 用于删除目录
+import re
+import shutil
 
 # 禁用 SSL 证书验证警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# 解析 Docker Pull 链接
+
+# ── Token 交换流程 ──────────────────────────────────────────────
+
+def get_bearer_token(harbor_host, project_name, image_name, portal="https",
+                     verify_ssl=False):
+    """
+    Docker Registry V2 匿名 token 交换。
+    公开项目的标准流程: 先发请求触发 401，从 Www-Authenticate 头
+    解析 realm/service/scope，向 token 服务换取匿名 Bearer token。
+    """
+    url = f"{portal}://{harbor_host}/v2/{project_name}/{image_name}/manifests/latest"
+    try:
+        resp = requests.get(url, verify=verify_ssl, timeout=15)
+    except requests.RequestException:
+        return None
+
+    if resp.status_code != 401:
+        return None
+
+    auth_header = resp.headers.get("www-authenticate", "")
+    realm = re.search(r'realm="([^"]+)"', auth_header)
+    if not realm:
+        return None
+
+    service = re.search(r'service="([^"]+)"', auth_header)
+    scope = re.search(r'scope="([^"]+)"', auth_header)
+
+    params = {}
+    if service:
+        params["service"] = service.group(1)
+    if scope:
+        params["scope"] = scope.group(1)
+
+    try:
+        token_resp = requests.get(realm.group(1), params=params,
+                                  verify=verify_ssl, timeout=15)
+    except requests.RequestException:
+        return None
+
+    if token_resp.status_code == 200:
+        data = token_resp.json()
+        return data.get("token") or data.get("access_token")
+    return None
+
+
+# ── 链接解析 ─────────────────────────────────────────────────────
+
 def parse_docker_pull_link(pull_link):
-    """
-    解析 Docker Pull 链接，提取 Harbor 地址、项目名称、镜像名称和标签或摘要。
-    示例链接：
-    - harbor.example.com/myproject/nginx:latest
-    - harbor.example.com/myproject/random-image/random-name@sha256:randomdigest
-    """
     if "://" in pull_link:
-        raise ValueError("Docker pull link should not include protocol (e.g., http://).")
+        raise ValueError(
+            "Docker pull link should not include protocol (e.g., http://).")
 
     parts = pull_link.split("/")
     if len(parts) < 3:
-        raise ValueError("Invalid Docker pull link format. Expected: <harbor-host>/<project>/<image>:<tag> or <harbor-host>/<project>/<image>/<image-name>@sha256:<digest>")
+        raise ValueError(
+            "Invalid Docker pull link format. "
+            "Expected: <harbor-host>/<project>/<image>:<tag> "
+            "or <harbor-host>/<project>/<image>/<name>@sha256:<digest>")
 
     harbor_host = parts[0]
     project_name = parts[1]
-    image_and_ref = "/".join(parts[2:])  # 处理多层镜像名称
+    image_and_ref = "/".join(parts[2:])
 
-    # 判断是标签还是摘要
     if "@sha256:" in image_and_ref:
         image_name, image_ref = image_and_ref.split("@sha256:")
-        image_ref = f"sha256:{image_ref}"  # 确保摘要格式正确
+        image_ref = f"sha256:{image_ref}"
     elif ":" in image_and_ref:
         image_name, image_ref = image_and_ref.split(":")
     else:
         image_name = image_and_ref
-        image_ref = "latest"  # 默认标签
+        image_ref = "latest"
 
     return harbor_host, project_name, image_name, image_ref
 
-# 获取 Manifest 的 URL
-def get_manifest_url(harbor_host, project_name, image_name, image_ref,portal):
-    if portal=="http":
-        return f"http://{harbor_host}/v2/{project_name}/{image_name}/manifests/{image_ref}"
-    else:
-        return f"https://{harbor_host}/v2/{project_name}/{image_name}/manifests/{image_ref}"
 
-# 获取 Blob（层）的 URL
-def get_blob_url(harbor_host, project_name, image_name, blob_digest,portal):
-    if portal=="http":
-        return f"http://{harbor_host}/v2/{project_name}/{image_name}/blobs/{blob_digest}"
-    else:
-        return f"https://{harbor_host}/v2/{project_name}/{image_name}/blobs/{blob_digest}"
+# ── URL 构造 ─────────────────────────────────────────────────────
 
-# 获取镜像的 Manifest
-def get_manifest(harbor_host, project_name, image_name, image_ref, auth=None, verify_ssl=False, hostname=None,portal=None):
-    url = get_manifest_url(harbor_host, project_name, image_name, image_ref,portal)
-    headers = {
-        "Accept": "application/vnd.docker.distribution.manifest.v2+json"
-    }
+def get_manifest_url(harbor_host, project_name, image_name, image_ref,
+                     portal="https"):
+    return (f"{portal}://{harbor_host}/v2/"
+            f"{project_name}/{image_name}/manifests/{image_ref}")
+
+
+def get_blob_url(harbor_host, project_name, image_name, blob_digest,
+                 portal="https"):
+    return (f"{portal}://{harbor_host}/v2/"
+            f"{project_name}/{image_name}/blobs/{blob_digest}")
+
+
+# ── Manifest ─────────────────────────────────────────────────────
+
+def get_manifest(harbor_host, project_name, image_name, image_ref,
+                 auth=None, token=None, verify_ssl=False, hostname=None,
+                 portal="https"):
+    url = get_manifest_url(harbor_host, project_name, image_name,
+                           image_ref, portal)
+    req_headers = {"Accept": "application/vnd.docker.distribution.manifest.v2+json"}
     if hostname:
-        headers["Host"] = hostname
-    response = requests.get(url, headers=headers, auth=auth, verify=verify_ssl)
-    if response.status_code != 200:
-        raise Exception(f"Failed to fetch manifest: {response.status_code} {response.text}")
-    return response.json()
+        req_headers["Host"] = hostname
+    if token:
+        req_headers["Authorization"] = f"Bearer {token}"
 
-# 下载 Blob（层或 Config 文件）
-def download_blob(harbor_host, project_name, image_name, blob_digest, output_dir, auth=None, verify_ssl=False, hostname=None, is_config=False,portal=None):
-    url = get_blob_url(harbor_host, project_name, image_name, blob_digest,portal=portal)
-    headers = {}
+    resp = requests.get(url, headers=req_headers, auth=auth,
+                        verify=verify_ssl, timeout=60)
+    if resp.status_code != 200:
+        raise Exception(
+            f"Failed to fetch manifest: {resp.status_code} {resp.text[:500]}")
+    return resp.json()
+
+
+# ── Blob 下载 ────────────────────────────────────────────────────
+
+def download_blob(harbor_host, project_name, image_name, blob_digest,
+                  output_dir, auth=None, token=None, verify_ssl=False,
+                  hostname=None, is_config=False, portal="https"):
+    url = get_blob_url(harbor_host, project_name, image_name, blob_digest,
+                       portal)
+    req_headers = {}
     if hostname:
-        headers["Host"] = hostname
-    response = requests.get(url, headers=headers, auth=auth, stream=True, verify=verify_ssl)
-    if response.status_code != 200:
-        raise Exception(f"Failed to download blob: {response.status_code} {response.text}")
+        req_headers["Host"] = hostname
+    if token:
+        req_headers["Authorization"] = f"Bearer {token}"
 
-    # 保存 Blob 到文件
-    if is_config:
-        # Config 文件保存为 .json
-        blob_path = os.path.join(output_dir, blob_digest.replace(":", "_") + ".json")
-    else:
-        # 层文件保存为 .tar.gz
-        blob_path = os.path.join(output_dir, blob_digest.replace(":", "_") + ".tar.gz")
-    
+    resp = requests.get(url, headers=req_headers, auth=auth, stream=True,
+                        verify=verify_ssl, timeout=120)
+    if resp.status_code != 200:
+        raise Exception(
+            f"Failed to download blob: {resp.status_code} {resp.text[:500]}")
+
+    ext = ".json" if is_config else ".tar.gz"
+    blob_path = os.path.join(output_dir, blob_digest.replace(":", "_") + ext)
     with open(blob_path, "wb") as f:
-        for chunk in response.iter_content(chunk_size=8192):
+        for chunk in resp.iter_content(chunk_size=8192):
             f.write(chunk)
     return blob_path
 
-# 拉取镜像并保存为 tar 文件
-def pull_image(harbor_host, project_name, image_name, image_ref, output_dir, auth=None, verify_ssl=False, hostname=None,portal=None):
-    # 创建输出目录
+
+# ── 鉴权决策 ─────────────────────────────────────────────────────
+
+def resolve_auth(harbor_host, project_name, image_name, auth=None,
+                 token=None, anonymous=False, portal="https",
+                 verify_ssl=False):
+    """
+    确定最终使用的鉴权方式，返回 (effective_auth, effective_token)。
+    优先级:
+      1. 外部传入的 token
+      2. 用户提供的 Basic Auth（失败则 fallback 匿名 token）
+      3. 匿名 token（公开项目）
+    """
+    if token:
+        print("Using provided Bearer token.")
+        return None, token
+
+    if auth and not anonymous:
+        print(f"Trying Basic Auth (user={auth[0]})...")
+        # 快速验证 Basic Auth 是否有效
+        url = f"{portal}://{harbor_host}/v2/"
+        req_headers = {}
+        try:
+            resp = requests.get(url, headers=req_headers, auth=auth,
+                                verify=verify_ssl, timeout=15)
+            if resp.status_code == 200:
+                print("Basic Auth succeeded.")
+                return auth, None
+        except requests.RequestException:
+            pass
+
+        # Basic Auth 失败，尝试匿名 token
+        print("Basic Auth rejected, falling back to anonymous token...")
+        anon_token = get_bearer_token(harbor_host, project_name, image_name,
+                                      portal=portal, verify_ssl=verify_ssl)
+        if anon_token:
+            print("Anonymous token obtained.")
+            return None, anon_token
+        raise Exception(
+            "Authentication failed: Basic Auth rejected and no anonymous "
+            "token available. This repository may require valid credentials.")
+
+    # 匿名模式
+    print("Fetching anonymous Bearer token...")
+    anon_token = get_bearer_token(harbor_host, project_name, image_name,
+                                  portal=portal, verify_ssl=verify_ssl)
+    if anon_token:
+        print("Anonymous token obtained.")
+        return None, anon_token
+    raise Exception(
+        "No anonymous token available. The registry may require "
+        "authentication. Try providing --username and --password.")
+
+
+# ── 拉取镜像 ─────────────────────────────────────────────────────
+
+def pull_image(harbor_host, project_name, image_name, image_ref,
+               output_dir, auth=None, token=None, verify_ssl=False,
+               hostname=None, portal="https", anonymous=False):
     os.makedirs(output_dir, exist_ok=True)
 
-    # 获取 Manifest
-    try:
-        manifest = get_manifest(harbor_host, project_name, image_name, image_ref, auth, verify_ssl, hostname,portal=portal)
-        print("Manifest fetched successfully.")
-    except Exception as e:
-        print(f"Failed to fetch manifest: {e}")
-        return
+    # Step 1: 确定鉴权方式
+    effective_auth, effective_token = resolve_auth(
+        harbor_host, project_name, image_name, auth=auth, token=token,
+        anonymous=anonymous, portal=portal, verify_ssl=verify_ssl)
 
-    # 下载 Config 文件
+    # Step 2: 获取 Manifest
+    manifest = get_manifest(harbor_host, project_name, image_name,
+                            image_ref, auth=effective_auth,
+                            token=effective_token, verify_ssl=verify_ssl,
+                            hostname=hostname, portal=portal)
+    print("Manifest fetched successfully.")
+
+    # Step 3: 下载 Config
     config_digest = manifest["config"]["digest"]
     config_file = config_digest.replace(":", "_") + ".json"
     config_path = os.path.join(output_dir, config_file)
     if not os.path.exists(config_path):
         print(f"Downloading config file: {config_digest}")
-        try:
-            download_blob(harbor_host, project_name, image_name, config_digest, output_dir, auth, verify_ssl, hostname, is_config=True,portal=portal)
-        except Exception as e:
-            print(f"Failed to download config file: {e}")
-            return
+        download_blob(harbor_host, project_name, image_name, config_digest,
+                      output_dir, auth=effective_auth, token=effective_token,
+                      verify_ssl=verify_ssl, hostname=hostname, is_config=True,
+                      portal=portal)
 
-    # 下载所有层文件
-    layers = manifest.get("layers", [])
-    for layer in layers:
+    # Step 4: 下载所有层
+    for layer in manifest.get("layers", []):
         blob_digest = layer["digest"]
-        print(f"Downloading layer: {blob_digest}")
-        try:
-            download_blob(harbor_host, project_name, image_name, blob_digest, output_dir, auth, verify_ssl, hostname,portal=portal)
-        except Exception as e:
-            print(f"Failed to download layer {blob_digest}: {e}")
-            return
+        print(f"Downloading layer: {blob_digest}  "
+              f"({layer.get('size', '?')} bytes)")
+        download_blob(harbor_host, project_name, image_name, blob_digest,
+                      output_dir, auth=effective_auth, token=effective_token,
+                      verify_ssl=verify_ssl, hostname=hostname, portal=portal)
 
-    # 保存 Manifest
+    # Step 5: 保存 Manifest
     manifest_path = os.path.join(output_dir, "manifest.json")
     with open(manifest_path, "w") as f:
         json.dump(manifest, f)
     print(f"Manifest saved to {manifest_path}")
-
     print("Image pulled successfully.")
 
-# 将下载的镜像文件打包为 tar 文件
+
+# ── 打包 tar ─────────────────────────────────────────────────────
+
 def create_image_tar(output_dir, tar_path, pull_link):
-    """
-    将下载的镜像文件打包为 Docker 镜像的 tar 文件。
-    :param output_dir: 下载的镜像文件目录
-    :param tar_path: 输出的 tar 文件路径
-    :param pull_link: Docker pull 链接，用于生成 RepoTags
-    """
-    # 读取 Manifest 文件
     manifest_path = os.path.join(output_dir, "manifest.json")
     if not os.path.exists(manifest_path):
         raise FileNotFoundError(f"Manifest file not found: {manifest_path}")
 
     with open(manifest_path, "r") as f:
-        try:
-            manifest = json.load(f)
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Manifest file is not valid JSON: {e}")
+        manifest = json.load(f)
 
-    if not manifest:
-        raise ValueError("Manifest file is empty or invalid.")
-
-    # 检查 Manifest 格式
     if not isinstance(manifest, dict):
-        raise ValueError("Manifest file is not in the expected format (expected a dictionary).")
-
+        raise ValueError("Manifest is not in expected format (dict).")
     if "config" not in manifest or "layers" not in manifest:
-        raise ValueError("Manifest file is not in the expected format (missing 'config' or 'layers').")
+        raise ValueError("Manifest missing 'config' or 'layers'.")
 
-    # 获取 Config 文件和层文件
     config_digest = manifest["config"]["digest"].replace(":", "_") + ".json"
-    layer_files = [layer["digest"].replace(":", "_") + ".tar.gz" for layer in manifest["layers"]]
+    layer_files = [layer["digest"].replace(":", "_") + ".tar.gz"
+                   for layer in manifest["layers"]]
 
-    # 检查 Config 文件是否存在
     config_path = os.path.join(output_dir, config_digest)
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Config file not found: {config_path}")
+    for lf in layer_files:
+        if not os.path.exists(os.path.join(output_dir, lf)):
+            raise FileNotFoundError(f"Layer file not found: {lf}")
 
-    # 检查层文件是否存在
-    for layer_file in layer_files:
-        layer_path = os.path.join(output_dir, layer_file)
-        if not os.path.exists(layer_path):
-            raise FileNotFoundError(f"Layer file not found: {layer_path}")
-
-    # 处理 pull_link，生成合法的 RepoTags
     if "@sha256:" in pull_link:
-        # 如果 pull_link 包含 @sha256:，将其转换为合法的标签格式
         repo, digest = pull_link.split("@sha256:")
-        repo_tag = f"{repo}:sha256-{digest}"  # 将 @sha256: 替换为 :sha256-
+        repo_tag = f"{repo}:sha256-{digest}"
     else:
-        # 如果 pull_link 是标准的 <repository>:<tag> 格式，直接使用
         repo_tag = pull_link
 
-    # 生成符合 Docker 镜像 tar 文件格式的 manifest.json
-    docker_manifest = [
-        {
-            "Config": config_digest,
-            "RepoTags": [repo_tag],  # 使用处理后的 repo_tag
-            "Layers": layer_files
-        }
-    ]
+    docker_manifest = [{
+        "Config": config_digest,
+        "RepoTags": [repo_tag],
+        "Layers": layer_files,
+    }]
 
-    # 保存新的 manifest.json
     docker_manifest_path = os.path.join(output_dir, "manifest.json")
     with open(docker_manifest_path, "w") as f:
         json.dump(docker_manifest, f)
 
-    # 创建 tar 文件
     with tarfile.open(tar_path, "w") as tar:
-        # 添加新的 manifest.json
         tar.add(docker_manifest_path, arcname="manifest.json")
-
-        # 添加 Config 文件
         tar.add(config_path, arcname=config_digest)
+        for lf in layer_files:
+            tar.add(os.path.join(output_dir, lf), arcname=lf)
 
-        # 添加层文件
-        for layer_file in layer_files:
-            layer_path = os.path.join(output_dir, layer_file)
-            tar.add(layer_path, arcname=layer_file)
+    print(f"Image tar file created: {tar_path}")
 
-    print(f"Image tar file created successfully: {tar_path}")
 
-# 主函数
+# ── 主入口 ───────────────────────────────────────────────────────
+
 def main():
-    # 解析命令行参数
-    parser = argparse.ArgumentParser(description="Pull a Docker image from Harbor and save it as a tar file.")
-    parser.add_argument("pull_link", type=str, help="Docker pull link (e.g., harbor.example.com/myproject/nginx:latest or harbor.example.com/myproject/random-image/random-name@sha256:randomdigest)")
-    parser.add_argument("--username", type=str, default="admin", help="Harbor username (default: admin)")
-    parser.add_argument("--password", type=str, default="Harbor12345", help="Harbor password (default: Harbor12345)")
-    parser.add_argument("--output-dir", type=str, default="output_image", help="Temporary directory for storing downloaded files (will be deleted after tar creation)")
-    parser.add_argument("--verify-ssl", action="store_true", help="Verify SSL certificate (default: False)")
-    parser.add_argument("--hostname", type=str, help="Custom Host header for requests (e.g., harbor.example.com)")
-    parser.add_argument("--portal", type=str, help="http or https")
+    parser = argparse.ArgumentParser(
+        description="Pull a Docker image from Harbor (public or private) "
+                    "and save as tar.")
+    parser.add_argument("pull_link", type=str,
+                        help="Docker pull link, e.g. "
+                             "registry.example.com/project/image:tag "
+                             "or .../image@sha256:digest")
+    parser.add_argument("--username", type=str, default=None,
+                        help="Harbor username (for private repos)")
+    parser.add_argument("--password", type=str, default=None,
+                        help="Harbor password (for private repos)")
+    parser.add_argument("--token", type=str, default=None,
+                        help="Pre-obtained Bearer token")
+    parser.add_argument("--anonymous", action="store_true",
+                        help="Force anonymous access (ignore --username/--password)")
+    parser.add_argument("--output-dir", type=str, default="output_image",
+                        help="Temp dir for downloaded files (deleted after tar)")
+    parser.add_argument("--verify-ssl", action="store_true",
+                        help="Verify SSL certificate (default: False)")
+    parser.add_argument("--hostname", type=str,
+                        help="Custom Host header for requests")
+    parser.add_argument("--portal", type=str, default="https",
+                        choices=["http", "https"],
+                        help="Protocol: http or https (default: https)")
     args = parser.parse_args()
 
-    # 解析 Docker Pull 链接
+    # ── 解析链接 ──
     try:
-        harbor_host, project_name, image_name, image_ref = parse_docker_pull_link(args.pull_link)
-        print(f"Parsed Docker pull link: Host={harbor_host}, Project={project_name}, Image={image_name}, Ref={image_ref}")
+        harbor_host, project_name, image_name, image_ref = \
+            parse_docker_pull_link(args.pull_link)
+        print(f"Parsed: Host={harbor_host}, Project={project_name}, "
+              f"Image={image_name}, Ref={image_ref}")
     except ValueError as e:
-        print(f"Error parsing Docker pull link: {e}")
+        print(f"Error: {e}")
         return
 
-    # 认证信息（默认使用 admin/Harbor12345）
-    auth = (args.username, args.password)
-    print(f"Using authentication: username={args.username}, password=******")
+    # ── 鉴权准备 ──
+    auth = None
+    if args.anonymous:
+        print("Forcing anonymous access.")
+    elif args.username and args.password:
+        auth = (args.username, args.password)
+    elif args.username or args.password:
+        print("Warning: both --username and --password required for "
+              "Basic Auth. Falling back to anonymous.")
+    else:
+        print("No credentials provided, using anonymous access.")
 
-    # SSL 证书验证
     verify_ssl = args.verify_ssl
-    print(f"SSL certificate verification: {verify_ssl}")
-
-    # 自定义 Host 头
     hostname = args.hostname
-    if hostname:
-        print(f"Using custom Host header: {hostname}")
+    portal = args.portal
 
-    portal=args.portal
-    if portal:
-        print(f"Using portal: {portal}")
-
-    # 拉取镜像
+    # ── 拉取 ──
     try:
-        pull_image(harbor_host, project_name, image_name, image_ref, args.output_dir, auth, verify_ssl, hostname,portal=portal)
+        pull_image(harbor_host, project_name, image_name, image_ref,
+                   args.output_dir, auth=auth, token=args.token,
+                   verify_ssl=verify_ssl, hostname=hostname,
+                   portal=portal, anonymous=args.anonymous)
     except Exception as e:
         print(f"Failed to pull image: {e}")
         return
 
-    # 打包镜像为 tar 文件
+    # ── 打包 ──
     tar_path = f"{image_name.replace('/', '_')}_{image_ref.replace(':', '_')}.tar"
     try:
         create_image_tar(args.output_dir, tar_path, args.pull_link)
     except Exception as e:
-        print(f"Failed to create image tar file: {e}")
+        print(f"Failed to create tar: {e}")
         return
 
-    # 删除临时文件夹
+    # ── 清理 ──
     try:
         shutil.rmtree(args.output_dir)
-        print(f"Temporary directory '{args.output_dir}' deleted successfully.")
+        print(f"Temp dir '{args.output_dir}' deleted.")
     except Exception as e:
-        print(f"Failed to delete temporary directory '{args.output_dir}': {e}")
+        print(f"Warning: could not delete temp dir: {e}")
+
 
 if __name__ == "__main__":
     main()
