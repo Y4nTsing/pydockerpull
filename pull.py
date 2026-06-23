@@ -6,6 +6,7 @@ import argparse
 import urllib3
 import re
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 禁用 SSL 证书验证警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -204,7 +205,8 @@ def resolve_auth(harbor_host, project_name, image_name, auth=None,
 
 def pull_image(harbor_host, project_name, image_name, image_ref,
                output_dir, auth=None, token=None, verify_ssl=False,
-               hostname=None, portal="https", anonymous=False):
+               hostname=None, portal="https", anonymous=False,
+               workers=4):
     os.makedirs(output_dir, exist_ok=True)
 
     # Step 1: 确定鉴权方式
@@ -219,25 +221,49 @@ def pull_image(harbor_host, project_name, image_name, image_ref,
                             hostname=hostname, portal=portal)
     print("Manifest fetched successfully.")
 
-    # Step 3: 下载 Config
+    # Step 3+4: 并行下载 config + 全部 layer
+    layers = manifest.get("layers", [])
     config_digest = manifest["config"]["digest"]
-    config_file = config_digest.replace(":", "_") + ".json"
-    config_path = os.path.join(output_dir, config_file)
-    if not os.path.exists(config_path):
-        print(f"Downloading config file: {config_digest}")
-        download_blob(harbor_host, project_name, image_name, config_digest,
-                      output_dir, auth=effective_auth, token=effective_token,
-                      verify_ssl=verify_ssl, hostname=hostname, is_config=True,
-                      portal=portal)
 
-    # Step 4: 下载所有层
-    for layer in manifest.get("layers", []):
+    # 收集待下载项（跳过已存在的文件）
+    downloads = []
+    ext = ".json"
+    path = os.path.join(output_dir, config_digest.replace(":", "_") + ext)
+    if not os.path.exists(path):
+        downloads.append(("config", config_digest))
+
+    for layer in layers:
         blob_digest = layer["digest"]
-        print(f"Downloading layer: {blob_digest}  "
-              f"({layer.get('size', '?')} bytes)")
-        download_blob(harbor_host, project_name, image_name, blob_digest,
-                      output_dir, auth=effective_auth, token=effective_token,
-                      verify_ssl=verify_ssl, hostname=hostname, portal=portal)
+        ext = ".tar.gz"
+        path = os.path.join(output_dir, blob_digest.replace(":", "_") + ext)
+        if not os.path.exists(path):
+            downloads.append(("layer", blob_digest))
+
+    if downloads:
+        n = len(downloads)
+        print(f"Downloading {n} blob(s) with {workers} worker(s)...")
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {}
+            for dl_type, digest in downloads:
+                is_config = (dl_type == "config")
+                f = executor.submit(
+                    download_blob,
+                    harbor_host, project_name, image_name, digest,
+                    output_dir,
+                    auth=effective_auth, token=effective_token,
+                    verify_ssl=verify_ssl, hostname=hostname,
+                    is_config=is_config, portal=portal)
+                futures[f] = digest
+
+            for future in as_completed(futures):
+                digest = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    raise Exception(
+                        f"Failed to download blob {digest}: {e}") from e
+    else:
+        print("All blobs already downloaded (resuming).")
 
     # Step 5: 保存 Manifest
     manifest_path = os.path.join(output_dir, "manifest.json")
@@ -298,6 +324,80 @@ def create_image_tar(output_dir, tar_path, pull_link):
     print(f"Image tar file created: {tar_path}")
 
 
+# ── Layer 提取（无 Docker 直接导出文件系统）────────────────────────
+
+def _apply_whiteout(target_dir, dirname, basename):
+    if basename == '.wh..wh..opq':
+        # Opaque whiteout: 清除该目录在下层中所有内容
+        opaque_dir = os.path.join(target_dir, dirname)
+        if os.path.isdir(opaque_dir):
+            for entry in os.listdir(opaque_dir):
+                entry_path = os.path.join(opaque_dir, entry)
+                if os.path.isdir(entry_path) and not os.path.islink(entry_path):
+                    shutil.rmtree(entry_path)
+                else:
+                    os.remove(entry_path)
+        return
+
+    # 常规 whiteout: .wh.<filename> 表示删除 <filename>
+    if len(basename) <= 4 or not basename.startswith('.wh.'):
+        return
+    hidden_name = basename[4:]
+    if not hidden_name:
+        return
+    hidden_path = os.path.join(target_dir, dirname, hidden_name)
+    if os.path.lexists(hidden_path):
+        if os.path.isdir(hidden_path) and not os.path.islink(hidden_path):
+            shutil.rmtree(hidden_path)
+        else:
+            os.remove(hidden_path)
+
+
+def extract_layer(tar_gz_path, target_dir):
+    with tarfile.open(tar_gz_path, 'r:gz') as tar:
+        for member in tar:
+            dirname = os.path.dirname(member.name)
+            basename = os.path.basename(member.name)
+
+            if basename.startswith('.wh.'):
+                _apply_whiteout(target_dir, dirname, basename)
+                continue
+
+            # 安全校验：防止路径穿越
+            normalized = os.path.normpath(member.name)
+            if os.path.isabs(normalized) or normalized.startswith('..'):
+                print(f"  Skipping suspicious path in layer: {member.name}")
+                continue
+
+            tar.extract(member, target_dir, set_attrs=False)
+
+
+def extract_layers_to_dir(output_dir, target_dir):
+    manifest_path = os.path.join(output_dir, "manifest.json")
+    with open(manifest_path, "r") as f:
+        manifest = json.load(f)
+
+    layers = manifest.get("layers", [])
+    if not layers:
+        print("No layers found in manifest.")
+        return
+
+    os.makedirs(target_dir, exist_ok=True)
+
+    for i, layer in enumerate(layers, 1):
+        blob_digest = layer["digest"].replace(":", "_") + ".tar.gz"
+        blob_path = os.path.join(output_dir, blob_digest)
+
+        if not os.path.exists(blob_path):
+            print(f"Warning: layer {i}/{len(layers)} not found: {blob_path}")
+            continue
+
+        print(f"Extracting layer {i}/{len(layers)}: {blob_digest}")
+        extract_layer(blob_path, target_dir)
+
+    print(f"Filesystem extracted to: {target_dir}")
+
+
 # ── 主入口 ───────────────────────────────────────────────────────
 
 def main():
@@ -318,6 +418,11 @@ def main():
                         help="Force anonymous access (ignore --username/--password)")
     parser.add_argument("--output-dir", type=str, default="output_image",
                         help="Temp dir for downloaded files (deleted after tar)")
+    parser.add_argument("--extract-to", type=str, default=None,
+                        help="Extract merged filesystem directly to this dir "
+                             "(no Docker needed)")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="Number of parallel download threads (default: 4)")
     parser.add_argument("--verify-ssl", action="store_true",
                         help="Verify SSL certificate (default: False)")
     parser.add_argument("--hostname", type=str,
@@ -358,10 +463,19 @@ def main():
         pull_image(harbor_host, project_name, image_name, image_ref,
                    args.output_dir, auth=auth, token=args.token,
                    verify_ssl=verify_ssl, hostname=hostname,
-                   portal=portal, anonymous=args.anonymous)
+                   portal=portal, anonymous=args.anonymous,
+                   workers=args.workers)
     except Exception as e:
         print(f"Failed to pull image: {e}")
         return
+
+    # ── 提取文件系统（无 Docker）──
+    if args.extract_to:
+        try:
+            extract_layers_to_dir(args.output_dir, args.extract_to)
+        except Exception as e:
+            print(f"Failed to extract layers: {e}")
+            return
 
     # ── 打包 ──
     tar_path = f"{image_name.replace('/', '_')}_{image_ref.replace(':', '_')}.tar"
