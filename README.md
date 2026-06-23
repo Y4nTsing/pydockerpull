@@ -13,6 +13,4 @@ python3 pull.py x.x.x.x/aaa/bbb@sha256:xxxxxx
 
 可指定hostname，避免harbor配置0.0.0.0导致的无法pull的问题。
 
-因为匿名访问也需要传入账号密码，默认使用admin/Harbor12345进行认证，可通过参数修改账号密码。
-
 完成后通过docker load -i xxx.tar 进行镜像加载。
