@@ -395,7 +395,65 @@ def extract_layers_to_dir(output_dir, target_dir):
         print(f"Extracting layer {i}/{len(layers)}: {blob_digest}")
         extract_layer(blob_path, target_dir)
 
+    write_docker_history(output_dir, target_dir)
     print(f"Filesystem extracted to: {target_dir}")
+
+
+def _format_size(bytes_val):
+    if not bytes_val:
+        return "0 B"
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if bytes_val < 1024:
+            return f"{bytes_val:.1f} {unit}" if unit != 'B' else f"{int(bytes_val)} B"
+        bytes_val /= 1024
+    return f"{bytes_val:.1f} PB"
+
+
+def write_docker_history(output_dir, target_dir):
+    manifest_path = os.path.join(output_dir, "manifest.json")
+    with open(manifest_path, "r") as f:
+        manifest = json.load(f)
+
+    config_digest = manifest["config"]["digest"].replace(":", "_") + ".json"
+    config_path = os.path.join(output_dir, config_digest)
+
+    if not os.path.exists(config_path):
+        print("Config file not found, skipping docker history.")
+        return
+
+    with open(config_path, "r") as f:
+        config = json.load(f)
+
+    history = config.get("history", [])
+    layers = manifest.get("layers", [])
+
+    # 非空 history 条目与 manifest layers 一一对应
+    non_empty = [h for h in history if not h.get("empty_layer", False)]
+
+    history_path = os.path.join(target_dir, "docker-history.txt")
+    with open(history_path, "w") as f:
+        f.write(f"{'CREATED':<30} {'CREATED BY':<55} {'SIZE':>12}\n")
+        f.write("-" * 99 + "\n")
+
+        layer_idx = 0
+        for entry in history:
+            created = entry.get("created", "").replace("T", " ").replace("Z", "")[:29]
+            created_by = entry.get("created_by", "") or entry.get("comment", "")
+            if len(created_by) > 55:
+                created_by = created_by[:52] + "..."
+
+            if entry.get("empty_layer", False):
+                size = "0 B"
+            else:
+                if layer_idx < len(layers):
+                    size = _format_size(layers[layer_idx].get("size", 0))
+                    layer_idx += 1
+                else:
+                    size = "0 B"
+
+            f.write(f"{created:<30} {created_by:<55} {size:>12}\n")
+
+    print(f"Docker history written to: {history_path}")
 
 
 # ── 主入口 ───────────────────────────────────────────────────────

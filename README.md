@@ -74,6 +74,8 @@ python3 pull.py x.x.x.x/aaa/bbb:latest --extract-to ./rootfs
 
 方式二通过合并所有 layer（自动处理 whiteout 删除标记）直接重建文件系统，省去 `docker load → docker create → docker export → tar -xf` 的繁琐流程。
 
+导出目录中会自动生成 `docker-history.txt`，记录每一层的创建时间和构建指令（等效 `docker history`）。
+
 ## 断点续传
 
 下载中断后重跑同一命令，已下载的 blob 会被跳过，自动续传。
